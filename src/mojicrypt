@@ -1,0 +1,347 @@
+#!/usr/bin/env python
+
+# mojicrypt — aes-256-gcm encryption with unicode-encoded output
+# turns your secrets into a wall of emojis and symbols
+# works on text, binary files, images, whatever you throw at it
+
+import sys
+import os
+import argparse
+import secrets
+import time
+import uuid
+
+# requires pycryptodome
+from Crypto.Cipher import AES
+from Crypto.Protocol.KDF import scrypt
+from Crypto.Random import get_random_bytes
+
+APP_NAME = "mojicrypt"
+VERSION = "20260303"
+KEYFILE_LEN = 8192   # characters of hex entropy written to auto-generated keyfiles
+
+# params
+SCRYPT_N = 2**18    # cpu/memory cost
+SCRYPT_R = 8        # block size
+SCRYPT_P = 1        # parallelization
+SALT_LEN = 16       # 128-bit salt
+KEY_LEN = 32        # 256-bit key
+NONCE_LEN = 12      # 96-bit nonce (gcm standard)
+TAG_LEN = 16        # 128-bit auth tag
+HEADER_LEN = SALT_LEN + NONCE_LEN + TAG_LEN  # 44 bytes overhead
+
+
+# glyphs
+# 256 unique non-alphanumeric unicode symbols
+# each byte (0x00-0xFF) maps to one glyph — simple 1:1 encoding
+# curated from: emoji faces, nature, animals, food, misc symbols,
+#               arrows, geometric shapes, and math operators
+
+def _build_glyph_table():
+    """construct the 256-char glyph table from curated unicode ranges"""
+    codepoints = []
+
+    # emoji faces — smileys and expressions (64)
+    codepoints.extend(range(0x1F600, 0x1F640))
+
+    # weather and nature — cyclone through shooting star (32)
+    codepoints.extend(range(0x1F300, 0x1F320))
+
+    # animals — rat through blowfish (32)
+    codepoints.extend(range(0x1F400, 0x1F420))
+
+    # food — tomato through shrimp (32)
+    codepoints.extend(range(0x1F345, 0x1F365))
+
+    # misc symbols — sun through pointing fingers (32)
+    codepoints.extend(range(0x2600, 0x2620))
+
+    # arrows — left through rightwards paired (16)
+    codepoints.extend(range(0x2190, 0x21A0))
+
+    # geometric shapes — black square through white vertical rectangle (16)
+    codepoints.extend(range(0x25A0, 0x25B0))
+
+    # mathematical operators — for all through right angle (32)
+    codepoints.extend(range(0x2200, 0x2220))
+
+    table = "".join(chr(cp) for cp in codepoints)
+
+    # sanity checks
+    assert len(table) == 256, f"glyph table has {len(table)} entries, expected 256"
+    assert len(set(table)) == 256, "duplicate glyphs detected in table"
+    for g in table:
+        assert not g.isalnum(), f"alphanumeric char found: {g} (U+{ord(g):04X})"
+        assert not g.isspace(), f"whitespace char found: {g} (U+{ord(g):04X})"
+        # no joiners (ZWJ, ZWNJ, BOM)
+        assert ord(g) not in (0x200D, 0x200C, 0xFEFF), \
+            f"joiner/bom found: U+{ord(g):04X}"
+
+    return table
+
+
+GLYPH_TABLE = _build_glyph_table()
+GLYPH_TO_BYTE = {g: i for i, g in enumerate(GLYPH_TABLE)}
+
+
+# encode/decode
+
+def bytes_to_glyphs(data: bytes) -> str:
+    """encode raw bytes as unicode glyphs"""
+    return "".join(GLYPH_TABLE[b] for b in data)
+
+
+def glyphs_to_bytes(text: str) -> bytes:
+    """decode unicode glyphs back to raw bytes"""
+    result = []
+    for g in text:
+        if g not in GLYPH_TO_BYTE:
+            print(
+                f"error: invalid glyph in ciphertext: {g} (U+{ord(g):04X})",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        result.append(GLYPH_TO_BYTE[g])
+    return bytes(result)
+
+
+# crypto operations
+
+def derive_key(passphrase: str, salt: bytes) -> bytes:
+    """derive a 256-bit key from passphrase using scrypt"""
+    return scrypt(
+        passphrase.encode("utf-8"),
+        salt,
+        key_len=KEY_LEN,
+        N=SCRYPT_N,
+        r=SCRYPT_R,
+        p=SCRYPT_P,
+    )
+
+
+def encrypt_bytes(data: bytes, passphrase: str) -> str:
+    """encrypt raw bytes with aes-256-gcm, return unicode-encoded ciphertext"""
+    salt = get_random_bytes(SALT_LEN)
+    key = derive_key(passphrase, salt)
+
+    nonce = get_random_bytes(NONCE_LEN)
+    cipher = AES.new(key, AES.MODE_GCM, nonce=nonce)
+    ciphertext, tag = cipher.encrypt_and_digest(data)
+
+    # wire format: salt(16) || nonce(12) || tag(16) || ciphertext(N)
+    packed = salt + nonce + tag + ciphertext
+    return bytes_to_glyphs(packed)
+
+
+def decrypt_bytes(encoded: str, passphrase: str) -> bytes:
+    """decode unicode glyphs and decrypt with aes-256-gcm, return raw bytes"""
+    raw = glyphs_to_bytes(encoded)
+
+    if len(raw) < HEADER_LEN:
+        print("error: ciphertext too short to be valid", file=sys.stderr)
+        sys.exit(1)
+
+    # unpack: salt(16) || nonce(12) || tag(16) || ciphertext(N)
+    salt = raw[:SALT_LEN]
+    nonce = raw[SALT_LEN:SALT_LEN + NONCE_LEN]
+    tag = raw[SALT_LEN + NONCE_LEN:HEADER_LEN]
+    ciphertext = raw[HEADER_LEN:]
+
+    key = derive_key(passphrase, salt)
+
+    try:
+        cipher = AES.new(key, AES.MODE_GCM, nonce=nonce)
+        return cipher.decrypt_and_verify(ciphertext, tag)
+    except (ValueError, KeyError):
+        print(
+            "error: decryption failed — wrong passphrase or corrupted data",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+
+# text convenience wrappers
+
+def encrypt_text(plaintext: str, passphrase: str) -> str:
+    """encode text to utf-8, encrypt, return glyph string"""
+    return encrypt_bytes(plaintext.encode("utf-8"), passphrase)
+
+
+def decrypt_text(encoded: str, passphrase: str) -> str:
+    """decrypt and decode result as utf-8 text"""
+    raw = decrypt_bytes(encoded, passphrase)
+    try:
+        return raw.decode("utf-8")
+    except UnicodeDecodeError:
+        print(
+            "error: decrypted data is not valid utf-8 — "
+            "did you mean to use --file/-f to write to a binary output?",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+
+# keyfile helpers
+
+def generate_keyfile() -> tuple[str, str]:
+    """generate an 8192-char hex key, write it to a .ukey file, return (key, path)"""
+    key = secrets.token_hex(KEYFILE_LEN // 2)   # token_hex(N) gives 2*N hex chars
+    epoch = int(time.time())
+    uid = uuid.uuid4()
+    filename = f"mojicrypt-key{epoch}_{uid}.ukey"
+    with open(filename, "w", encoding="utf-8") as fh:
+        fh.write(key)
+    # lock it down — readable only by the owner
+    os.chmod(filename, 0o600)
+    return key, filename
+
+
+def load_keyfile(path: str) -> str:
+    """read a .ukey file and return its contents as the passphrase"""
+    if not os.path.isfile(path):
+        print(f"error: keyfile not found: {path}", file=sys.stderr)
+        sys.exit(1)
+    with open(path, "r", encoding="utf-8") as fh:
+        key = fh.read().strip()
+    if not key:
+        print(f"error: keyfile is empty: {path}", file=sys.stderr)
+        sys.exit(1)
+    return key
+
+
+# cli
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        prog=APP_NAME,
+        description="aes-256-gcm encryption with unicode-encoded output",
+    )
+    parser.add_argument(
+        "-v", "--version",
+        action="version",
+        version=f"{APP_NAME} {VERSION}",
+    )
+    parser.add_argument(
+        "mode",
+        choices=["encrypt", "decrypt"],
+        help="operation to perform",
+    )
+    parser.add_argument(
+        "text",
+        nargs="?",
+        help="text to encrypt/decrypt (reads stdin if omitted, ignored when -f is used)",
+    )
+    parser.add_argument(
+        "-p", "--passphrase",
+        help="passphrase (prompted securely if omitted)",
+    )
+    parser.add_argument(
+        "-f", "--file",
+        metavar="PATH",
+        help="input file to encrypt/decrypt",
+    )
+    parser.add_argument(
+        "-o", "--output",
+        metavar="PATH",
+        help=(
+            "output file path "
+            "(encrypt default: <input>.uc | decrypt default: strips .uc or appends .dec)"
+        ),
+    )
+    parser.add_argument(
+        "-k", "--keyfile",
+        metavar="PATH",
+        help="load passphrase from a .ukey file instead of -p",
+    )
+
+    args = parser.parse_args()
+
+    # resolve passphrase — priority: -p > -k > auto-generate (encrypt) / error (decrypt)
+    if args.passphrase:
+        passphrase = args.passphrase
+    elif args.keyfile:
+        passphrase = load_keyfile(args.keyfile)
+        print(f"using keyfile: {args.keyfile}", file=sys.stderr)
+    elif args.mode == "encrypt":
+        passphrase, kf_path = generate_keyfile()
+        print(f"no passphrase given - generated keyfile: {kf_path}", file=sys.stderr)
+        print("keep that file safe — you'll need it to decrypt", file=sys.stderr)
+    else:
+        print(
+            "error: no passphrase provided for decryption.\n"
+            "       use -p <passphrase> or -k <keyfile.ukey>",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    # file mode
+    if args.file:
+        in_path = args.file
+
+        if not os.path.isfile(in_path):
+            print(f"error: file not found: {in_path}", file=sys.stderr)
+            sys.exit(1)
+
+        if args.mode == "encrypt":
+            # default output: <input>.uc
+            out_path = args.output or (in_path + ".uc")
+
+            with open(in_path, "rb") as fh:
+                data = fh.read()
+
+            glyphs = encrypt_bytes(data, passphrase)
+
+            with open(out_path, "w", encoding="utf-8") as fh:
+                fh.write(glyphs)
+
+            print(f"encrypted → {out_path}", file=sys.stderr)
+
+        else:  # decrypt
+            # default output: strip .uc if present, else append .dec
+            if args.output:
+                out_path = args.output
+            elif in_path.endswith(".uc"):
+                out_path = in_path[:-3]
+            else:
+                out_path = in_path + ".dec"
+
+            with open(in_path, "r", encoding="utf-8") as fh:
+                encoded = fh.read().strip()
+
+            raw = decrypt_bytes(encoded, passphrase)
+
+            with open(out_path, "wb") as fh:
+                fh.write(raw)
+
+            print(f"decrypted → {out_path}", file=sys.stderr)
+
+        return
+
+    # ── text / stdin mode ──────────────────────────────────────
+    if args.text:
+        text = args.text
+    elif not sys.stdin.isatty():
+        text = sys.stdin.read()
+    else:
+        if args.mode == "encrypt":
+            print("enter plaintext (ctrl+d to finish):", file=sys.stderr)
+        else:
+            print("paste ciphertext (ctrl+d to finish):", file=sys.stderr)
+        text = sys.stdin.read()
+
+    if not text:
+        print("error: no input provided", file=sys.stderr)
+        sys.exit(1)
+
+    if args.mode == "encrypt":
+        result = encrypt_text(text, passphrase)
+        print(result)
+    else:
+        # strip whitespace from pasted ciphertext (none of our glyphs are whitespace)
+        result = decrypt_text(text.strip(), passphrase)
+        print(result)
+
+
+if __name__ == "__main__":
+    main()
